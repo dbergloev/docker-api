@@ -1,0 +1,980 @@
+#!/bin/bash
+
+###
+#
+#
+declare -A cnf=(
+    ["script.version"]="0.9.0"
+
+    ["reg.addr"]="${DOCKER_REG_ADDR:-https://index.docker.io/v2}"
+    ["reg.addr.auth"]="${DOCKER_REG_ADDR_AUTH:-https://auth.docker.io}"
+    ["reg.addr.service"]="${DOCKER_REG_ADDR_SERVICE:-registry.docker.io}"
+    ["reg.default.namespace"]="${DOCKER_REG_DEFAULT_NAMESPACE:-library}"
+    ["cache.dir"]="${DOCKER_CACHE_DIR:-/etc/docker-api}"
+    ["tmp.dir"]="${DOCKER_TMP_DIR:-/tmp}"
+
+    ##
+    # %1$s = 'reg.addr.auth'
+    # %2$s = 'reg.addr.service'
+    # %3$s = 'image.name'
+    ["url.auth"]="${DOCKER_URL_AUTH:-%s/token?service=%s&scope=repository:%s:pull}"
+
+    ##
+    # %1$s = 'reg.addr'
+    # %2$s = 'image.name'
+    # %3$s = <image tag>
+    ["url.manifest"]="${DOCKER_URL_MANIFEST:-%s/%s/manifests/%s}"
+
+    ##
+    # %1$s = 'reg.addr'
+    # %2$s = 'image.name'
+    ["url.tags"]="${DOCKER_URL_TAGS:-%s/%s/tags/list}"
+
+    ##
+    # %1$s = 'reg.addr'
+    # %2$s = 'image.name'
+    # %3$d = 'max output'
+    ["url.tags.pag"]="${DOCKER_URL_TAGS:-%s/%s/tags/list}"
+
+    ##
+    # %1$s = 'reg.addr'
+    # %2$s = 'image.name'
+    # %3$s = <digest>
+    ["url.blobs"]="${DOCKER_URL_BLOBS:-%s/%s/blobs/%s}"
+
+    ["debug.verbose"]="false"
+    ["debug.verbose.extra"]="false"
+)
+
+
+###
+#
+#
+declare help=(
+    "Usage: $(basename "$0") [OPTIONS] <MODULE> <CMD> [<ARGS>,...]"
+    ""
+    "+" "Modules:"
+    "registry"    "Run commands against the docker registry"
+    "library"     "Manage cached library information"
+    "inspect"     "Inspect manifest and blob json data from registry"
+    ""
+    ""
+    "+" "Registry Commands:"
+    "refresh <repo> [<reference> ...]"    "Refresh the offline registry data"
+    "info <repo> <reference>"             "Get info about a tag or image"
+    "list <repo> <reference>"             "List tags or images"
+    ""
+    ""
+    "+" "Library Commands:"
+    "init <repo>"    "Initialize a new library"
+    "info <repo>"    "Get info about a library"
+    "list"           "List all initialized libraries"
+    ""
+    ""
+    "+" "Inspect Commands:"
+    "manifest <repo> <reference>"    "Retrieve a manifest"
+    "blob <repo> <reference>"        "Retrieve a blob"
+    ""
+    ""
+    "+" "Registry Options:"
+    "--os <string>"      "Only show supported OS"
+    "--arch <string>"    "Only show supported architectures"
+    "--ere <regexp>"     "Only show/refresh tags matching this pattern"
+    ""
+    ""
+    "+" "Library Options:"
+    "--alias <string>"    "Add an alias that can be used instead of the full repository name"
+    ""
+    ""
+    "-" "When running the 'registry list' command the keyword 'tags' and 'images' can be used instead of a reference. You can then further use the '--os' and '--arch' options to sort the output."
+    ""
+    "-" "When running the 'registry refresh' command the keyword 'all' can be used to refresh all tags. By default it will only look for new/missing tags during a refresh."
+    ""
+)
+
+print_help() {
+    local max_len=0 len i ii has_column=0
+    
+    if which column >/dev/null 2>&1; then
+        has_column=1
+    fi
+    
+    for (( i=0; i < ${#help[@]}; i++ )); do
+        if [[ "${help[$i]}" = "+" ]]; then
+            for (( i=$(($i + 2)); i < ${#help[@]}; i=$(($i+2)) )); do
+                if [ -z "${help[$i]}" ]; then
+                    break
+                fi
+                
+                len=$(echo -n "${help[$i]}" | sed -e 's/^[ ]\+//' -e 's/[ ]\+//' | wc -c)
+                
+                if [ $len -gt $max_len ]; then
+                    max_len=$len
+                fi
+            done
+        fi
+    done
+
+    for (( i=0; i < ${#help[@]}; i++ )); do
+        case "${help[$i]}" in
+            '+')
+                echo "${help[$(($i + 1))]}"
+            
+                for (( ii=$(($i + 3)),i=$(($i + 2)); ii < ${#help[@]}; i=$(($i+2)),ii=$(($ii+2)) )); do
+                    if [ -z "${help[$i]}" ]; then
+                        break
+                    fi
+                    
+                    if [ $has_column -eq 1 ]; then
+                        printf "%-$((${max_len} + 4))s|%s\n" "  ${help[$i]}" "${help[$ii]}" | column -W 2 -t -s '|'
+                        
+                    else
+                        printf "%-$((${max_len} + 6))s %s\n" "  ${help[$i]}" "${help[$ii]}"
+                    fi
+                done
+            ;;
+            
+            '-')
+                i=$(($i + 1))
+                
+                if [ $has_column -eq 1 ]; then
+                    printf " *|%s\n" "${help[$i]}" | column -W 2 -t -s '|'
+                    
+                else
+                    echo " * ${help[$i]}"
+                fi
+            ;;
+            
+            *)
+                echo -e "${help[$i]}"
+            ;;
+        esac
+    done
+}
+
+
+###
+# Source: https://stackoverflow.com/questions/11856054
+#
+ere_quote() {
+    sed 's/[][\.|$(){}?+*^]/\\&/g' <<< "$*"
+}
+
+
+###
+#
+#
+print_err() {
+    local msg="$1"
+    local verb="$2"
+
+    echo "$msg" >&2
+
+    if jq empty >/dev/null 2>&1 <<< "$verb"; then
+        echo -e "\tCode: $(jq -r .errors[0].code <<< "$verb")" >&2
+        echo -e "\tMessage: $(jq -r .errors[0].message <<< "$verb")" >&2
+    fi
+
+    if [[ "${cnf["debug.verbose"]}" == "true" && -n "$verb" ]]; then
+        echo "------" >&2
+
+        if jq empty >/dev/null 2>&1 <<< "$verb"; then
+            echo "$(jq <<< "$verb")" >&2
+
+        else
+            echo "$verb" >&2
+        fi
+    fi
+}
+
+
+###
+#
+#
+print_debug() {
+    if [[ "${cnf["debug.verbose"]}" == "true" && -n "$1" ]]; then
+        if jq empty >/dev/null 2>&1 <<< "$1"; then
+            echo "$(jq <<< "$1")" >&2
+
+        else
+            echo -e "$1" >&2
+        fi
+    fi
+}
+
+
+###
+#
+#
+http_request() {
+    local http_response
+    local url="$1"; shift
+    local -a args=("$@")
+
+    args+=(-H "Content-Type: application/json;charset=UTF-8")
+
+    if [[ "${cnf["debug.verbose.extra"]}" == "true" ]]; then
+        echo "------" >&2
+        echo "Running curl '$url ${args[@]}'" >&2
+        echo "------" >&2
+    fi
+
+    # Make request
+    http_response="$(curl -sSL --write-out "HTTP_CODE:%{http_code}" \
+        "${args[@]}" \
+        -X GET "$url")"
+
+    # Output response
+    tr -d '\n' <<< "$http_response" | sed 's/HTTP_CODE:[0-9]\+$//'
+
+    # Return http status code
+    return $(tr -d '\n' <<< "$http_response" | grep -oe 'HTTP_CODE:[0-9]\+$' | awk -F: '{print $2}')
+}
+
+
+###
+#
+#
+auth_get_key() {
+    local forced="$1:-false"
+    local auth_url auth_key expires issued
+    local auth_file="$(printf '%s/%s.auth' \
+                        "${cnf["tmp.dir"]}" \
+                        "$(sed 's/\//_/g' <<< "${cnf["module.arg"]}")")"
+
+    if [[ "$forced" != "true" &&  -f $auth_file ]]; then
+        auth_key="$(cat $auth_file)"
+        expires=$(jq --raw-output .expires_in <<< "$auth_key")
+        issued=$(jq --raw-output .issued_at <<< "$auth_key")
+
+        if [[ -n "$issued" && $(bc -s <<< "($(date -d "$issued" '+%s') + ${expires:-60}) - $(date '+%s')") -ge 20 ]]; then
+            jq --raw-output .token <<< "$auth_key"
+
+            return 0
+        fi
+    fi
+
+    auth_url="$(printf "${cnf["url.auth"]}" "${cnf["reg.addr.auth"]}" "${cnf["reg.addr.service"]}" "${cnf["module.arg"]}")"
+    auth_key="$(http_request "$auth_url")"
+
+    if [ $? -ne 200 ]; then
+        print_err "Failed to get a registry key. Request returned error code $?" "$auth_key"
+
+        return 1
+
+    else
+        echo "$auth_key" | tee $auth_file >/dev/null 2>&1
+    fi
+
+    jq --raw-output .token <<< "$auth_key"
+
+    return 0
+}
+
+
+###
+#
+#
+do_registry_refresh() {
+    echo "Refreshing repository for '${cnf["module.arg"]}'"
+
+    local images=()
+    local tag tags_size tags_cur manifest submanifest json digest image arch os os_ver date ret tags_list url ii
+
+    if [[ -n "${cnf["module.extra"]}" && "${cnf["module.extra"]}" != "all" ]]; then
+        print_debug "Using pre-defined tag list '${cnf["module.extra"]}'"
+        tags_list="${cnf["module.extra"]}"
+
+    else
+        print_debug "Requesting tag list"
+        url="$(printf "${cnf["url.tags"]}" "${cnf["reg.addr"]}" "${cnf["module.arg"]}")"
+        tags_list="$(http_request "$url" -H "Authorization: Bearer $(auth_get_key)")"; ret=$?
+
+        if [ $ret -ne 200 ]; then
+            print_err "Trying to get tags list returned code $ret" "$tags_list"
+
+            exit 1
+        fi
+
+        if [ -n "${cnf["tags.regexp"]}" ]; then
+            print_debug "Using tags matching ere('${cnf["tags.regexp"]}')"
+            tags_list="$(jq -r '.tags[]' <<< "$tags_list" | grep -E -- "${cnf["tags.regexp"]}")"
+        
+        else
+            tags_list="$(jq -r '.tags[]' <<< "$tags_list")"
+        fi
+    fi
+
+    tags_size=$(wc <<< "$tags_list" | awk '{print $2}')
+    tags_cur=0
+
+    echo "Checking $tags_size tags"
+
+    for tag in $tags_list; do
+        tags_cur=$(($tags_cur + 1))
+        
+        if [ -f "${cnf["library.tags"]}" ] && grep -qE "^$(ere_quote "$tag")\|" "${cnf["library.tags"]}"; then
+            if [[ "${cnf["module.extra"]}" == "all" || " ${cnf["module.extra"]} " =~ " $tag " ]]; then
+                print_debug "Removing old references to tag '$tag'"
+                sed -i -E "/^$(ere_quote "$tag")\|/d" "${cnf["library.tags"]}"
+
+            else
+                continue
+            fi
+        fi
+
+        echo "$(bc -l <<< "$tags_cur / $tags_size * 100" | awk '{printf "%.0f", $1}')% Retriving manifest data for tag '${tag}'"
+
+        url="$(printf "${cnf["url.manifest"]}" "${cnf["reg.addr"]}" "${cnf["module.arg"]}" "$tag")"
+        manifest="$(http_request "$url" -H "Authorization: Bearer $(auth_get_key)" -H "Accept: application/vnd.docker.distribution.manifest.v2+json" -H "Accept: application/vnd.docker.distribution.manifest.list.v2+json" -H "Accept: application/vnd.oci.image.index.v1+json" -H "Accept: application/vnd.oci.image.manifest.v1+json")"; ret=$?
+
+        if [ $ret -ne 200 ]; then
+            print_err "Trying to get manifest for tag '$tag' returned code $ret" "$manifest"
+
+            exit 1
+        fi
+
+        if jq -r '.mediaType' <<< "$manifest" | grep -qe 'list\|index'; then
+            print_debug "Received manifest index for tag '$tag'"
+        
+            while read json; do
+                arch=$(jq -r '.platform.architecture | select( . != null )' <<< "$json")
+                os=$(jq -r '.platform.os | select( . != null )' <<< "$json")
+                os_ver=$(jq -r '.platform."os.version" | select( . != null )' <<< "$json")
+                
+                print_debug "Requesting manifest for tag '$tag', OS='$os' Arch='$arch'"
+                print_debug "  -> $(jq -r '.digest' <<< "$json")"
+                url="$(printf "${cnf["url.manifest"]}" "${cnf["reg.addr"]}" "${cnf["module.arg"]}" "$(jq -r '.digest' <<< "$json")")"
+                submanifest="$(http_request "$url" -H "Authorization: Bearer $(auth_get_key)" -H "Accept: application/vnd.docker.distribution.manifest.v2+json" -H "Accept: application/vnd.oci.image.manifest.v1+json")"; ret=$?
+
+                if [ $ret -ne 200 ]; then
+                    print_err "Trying to get manifest for tag '$tag' returned code $ret" "$submanifest"
+
+                    exit 1
+                fi
+
+                digest=$(jq -r '.config.digest' <<< "$submanifest")
+
+                if [ -f "${cnf["library.images"]}" ] && grep -qE "^$(ere_quote "$digest")\|" "${cnf["library.images"]}"; then
+                    echo "$tag|$digest" | tee -a "${cnf["library.tags"]}" >/dev/null
+
+                    continue
+
+                else
+                    echo "    Adding image $(cut -d ':' -f 1 <<< "$digest"):...${digest:63}"
+                    print_debug "      -> $digest"
+                fi
+
+                url="$(printf "${cnf["url.blobs"]}" "${cnf["reg.addr"]}" "${cnf["module.arg"]}" "$digest")"
+                image="$(http_request "$url" -H "Authorization: Bearer $(auth_get_key)" -H "Accept: application/vnd.docker.container.image.v1+json" -H "Accept: application/vnd.oci.image.config.v1+json")"; ret=$?
+
+                if [[ $ret -eq 147 && $ii -lt 2 ]]; then
+                    echo "    Signature mismatch, skipping"
+
+                    continue
+
+                elif [ $ret -ne 200 ]; then
+                    print_err "Trying to get image blob for tag '$tag' returned code $ret" "$image"
+
+                    exit 1
+                fi
+
+                date=$(jq -r '.created | select( . != null )' <<< "$image")
+                arch=${arch:-$(jq -r '.architecture | select( . != null )' <<< "$image")}
+                os=${os:-$(jq -r '.os | select( . != null )' <<< "$image")}
+                os_ver=${os_ver:-$(jq -r '."os.version" | select( . != null )' <<< "$image")}
+
+                echo "$digest|$arch|$os|$os_ver|$date" | tee -a "${cnf["library.images"]}" >/dev/null
+                echo "$tag|$digest" | tee -a "${cnf["library.tags"]}" >/dev/null
+
+            done < <(jq -c '.manifests[]' <<< "$manifest")
+
+        else
+            digest=$(jq -r '.config.digest' <<< "$manifest")
+
+            if [ -f "${cnf["library.images"]}" ] && grep -qE "^$(ere_quote "$digest")\|" "${cnf["library.images"]}"; then
+                echo "$tag|$digest" | tee -a "${cnf["library.tags"]}" >/dev/null
+
+                continue
+
+            else
+                echo "    Adding image $(cut -d ':' -f 1 <<< "$digest"):...${digest:63}"
+                print_debug "      -> $digest"
+            fi
+
+            url="$(printf "${cnf["url.blobs"]}" "${cnf["reg.addr"]}" "${cnf["module.arg"]}" "$digest")"
+            image="$(http_request "$url" -H "Authorization: Bearer $(auth_get_key)" -H "Accept: application/vnd.docker.container.image.v1+json" -H "Accept: application/vnd.oci.image.config.v1+json")"; ret=$?
+
+            if [[ $ret -eq 147 && $ii -lt 2 ]]; then
+                echo "    Image signature mismatch, skipping"
+
+                continue
+
+            elif [ $ret -ne 200 ]; then
+                print_err "Trying to get image blob for tag '$tag' returned code $ret" "$image"
+
+                exit 1
+            fi
+
+            arch=$(jq -r '.architecture | select( . != null )' <<< "$image")
+            os=$(jq -r '.os | select( . != null )' <<< "$image")
+            os_ver=$(jq -r '."os.version" | select( . != null )' <<< "$image")
+            date=$(jq -r '.created | select( . != null )' <<< "$image")
+
+            echo "$digest|$arch|$os|$os_ver|$date" | tee -a "${cnf["library.images"]}" >/dev/null
+            echo "$tag|$digest" | tee -a "${cnf["library.tags"]}" >/dev/null
+        fi
+    done
+
+    json="$(cat "${cnf["library.manifest"]}")"
+    json="$(jq ".date = \"$(date +'%F %T %z')\"" <<< "$json")"
+
+    tee "${cnf["library.manifest"]}" <<< "$json" >/dev/null
+
+    echo "Done"
+}
+
+
+###
+#
+#
+do_show_info() {
+    local reference="${cnf["module.extra"]}"
+    local ere="$(ere_quote "$reference")"
+    local split="awk -F|"
+    local digest line img_osv img_os img_arch img_date ii=0 tag tags sp
+
+    if [ -f "${cnf["library.tags"]}" ] && grep -qE "^$ere\|" "${cnf["library.tags"]}"; then
+        for digest in $(grep -E "^$ere\|" "${cnf["library.tags"]}" | $split '{print $2}'); do
+            line="$(grep -E "^$(ere_quote "$digest")\|" "${cnf["library.images"]}")"
+            img_osv="$($split '{print $4}' <<< "$line")"
+            img_os="$($split '{print $3}' <<< "$line")"
+            img_arch="$($split '{print $2}' <<< "$line")"
+
+            if [[ -n "${cnf["image.os"]}" && "${cnf["image.os"]}" != "$img_os" ]] \
+                 || [[ -n "${cnf["image.arch"]}" && "${cnf["image.arch"]}" != "$img_arch" ]]; then
+
+                continue
+            fi
+
+            ii=$(($ii + 1))
+            sp="$(printf -- ' %.0s' $(seq $((3 - $(echo -n "$ii" | wc | awk '{print $3}'))) ))"
+
+            if [ $ii -gt 1 ]; then
+                echo ""
+            fi
+
+            echo "$ii:${sp}$digest"
+            echo "      OS: $img_os $(test -n "$img_osv" && echo "($img_osv)")"
+            echo "      Arch: $img_arch"
+        done
+
+        if [ $ii -eq 0 ]; then
+            echo "No reference for '$reference' matching the criteria" >&2
+
+            return 1
+        fi
+
+    elif [ -f "${cnf["library.images"]}" ] && grep -qE "^$ere\|" "${cnf["library.images"]}"; then
+        line="$(grep -E "^$ere\|" "${cnf["library.images"]}")"
+        img_osv="$($split '{print $4}' <<< "$line")"
+        img_os="$($split '{print $3}' <<< "$line")"
+        img_arch="$($split '{print $2}' <<< "$line")"
+        img_date="$($split '{print $5}' <<< "$line")"
+
+        if [[ -n "${cnf["image.os"]}" && "${cnf["image.os"]}" != "$img_os" ]] \
+             || [[ -n "${cnf["image.arch"]}" && "${cnf["image.arch"]}" != "$img_arch" ]]; then
+
+            echo "No reference for '$reference' matching the criteria" >&2
+
+            return 1
+        fi
+
+        echo "OS: $img_os $(test -n "$img_osv" && echo "($img_osv)")"
+        echo "Arch: $img_arch"
+        echo "Created: $(date -d "$img_date" +'%Y-%m-%d %H:%M')"
+        echo -n "Tags: "
+
+        for tag in $(grep -E "\|$ere\$" "${cnf["library.tags"]}" | $split '{print $1}'); do
+            if [ $ii -gt 0 ]; then
+                echo -n ", "
+            fi
+
+            echo -n "$tag"
+
+            ii=$(($ii + 1))
+        done
+
+        echo ""
+
+    else
+        echo "Could not find the reference '$reference'" >&2
+
+        return 1
+    fi
+}
+
+
+###
+#
+#
+do_show_list() {
+    local reference="${cnf["module.extra"]}"
+    local ere="$(ere_quote "$reference")"
+    local split="awk -F|"
+    local digest line img_os img_arch ii=0 tag tags
+    local -a cache
+
+    [[ "$reference" == "tags" ]] && ere='sha[0-9]+:.*'
+    [[ "$reference" == "images" ]] && ere='.*'
+
+    if [[ "$reference" == "images" ]] || ( [ -f "${cnf["library.tags"]}" ] && grep -qE "^$ere\|" "${cnf["library.tags"]}" )  then
+        for digest in $(grep -E "^$ere\|" "${cnf["library.tags"]}" | $split '{print $2}'); do
+            line="$(grep -E "^$(ere_quote "$digest")\|" "${cnf["library.images"]}")"
+            img_os="$($split '{print $3}' <<< "$line")"
+            img_arch="$($split '{print $2}' <<< "$line")"
+
+            if [[ -n "${cnf["image.os"]}" && "${cnf["image.os"]}" != "$img_os" ]] \
+                 || [[ -n "${cnf["image.arch"]}" && "${cnf["image.arch"]}" != "$img_arch" ]]; then
+
+                continue
+            fi
+
+            ii=$(($ii + 1))
+
+            echo "$digest"
+        done
+
+    elif [[ "$reference" == "tags" ]] || ( [ -f "${cnf["library.images"]}" ] && grep -qE "^$ere\|" "${cnf["library.images"]}" ); then
+        for line in $(grep -E "^$ere\|" "${cnf["library.images"]}"); do
+            digest="$($split '{print $1}' <<< "$line")"
+            img_os="$($split '{print $3}' <<< "$line")"
+            img_arch="$($split '{print $2}' <<< "$line")"
+
+            if [[ -n "${cnf["image.os"]}" && "${cnf["image.os"]}" != "$img_os" ]] \
+                 || [[ -n "${cnf["image.arch"]}" && "${cnf["image.arch"]}" != "$img_arch" ]]; then
+
+                continue
+            fi
+
+            for tag in $(grep -E "\|$(ere_quote "$digest")$" "${cnf["library.tags"]}" | $split '{print $1}'); do
+                if [[ -n "${cnf["tags.regexp"]}" ]] && ! grep -qE -- "${cnf["tags.regexp"]}" <<< "$tag"; then
+                    continue
+            
+                elif [[ ! " ${cache[*]} " =~ " $tag " ]]; then
+                    ii=$(($ii + 1))
+                    cache+=( "$tag" )
+
+                    echo "$tag"
+                fi
+            done
+        done
+    fi
+
+    if [ $ii -eq 0 ]; then
+        return 1
+    fi
+}
+
+
+###
+#
+#
+do_init_library() {
+    local filename file url response ret manifest
+
+    if ! grep -q '/' <<< "${cnf["module.arg"]}"; then
+        if [ -z "${cnf["library.alias"]}" ]; then
+            cnf["library.alias"]="${cnf["module.arg"]}"
+        fi
+
+        cnf["module.arg"]="${cnf["reg.default.namespace"]}/${cnf["module.arg"]}"
+    fi
+
+    case "${cnf["module.cmd"]}" in
+        "init")
+            filename="$(md5sum <<< "${cnf["module.arg"]}" | awk '{print $1}' | grep -o "$(printf '.%.0s' {1..14})$")"
+            file="${cnf["cache.dir"]}/${filename}.manifest"
+
+            # Make sure that this actually exists
+            url="$(printf "${cnf["url.tags"]}?n=%d" "${cnf["reg.addr"]}" "${cnf["module.arg"]}" "0")"
+            response="$(http_request "$url" -H "Authorization: Bearer $(auth_get_key)")"; ret=$?
+
+            if [ $ret -ne 200 ]; then
+                echo "The library '${cnf["module.arg"]}' does not exist" >&2; return 1
+
+            else
+                echo "Initializing '${cnf["module.arg"]}' ($filename)"
+            fi
+
+            manifest="$(jq ".library = \"${cnf["module.arg"]}\"" <<< "{}")"
+            manifest="$(jq ".alias = \"${cnf["module.arg"]}\"" <<< "$manifest")"
+            manifest="$(jq ".files.tags = \"${cnf["cache.dir"]}/${filename}.tags\"" <<< "$manifest")"
+            manifest="$(jq ".files.images = \"${cnf["cache.dir"]}/${filename}.images\"" <<< "$manifest")"
+            manifest="$(jq ".date = \"\"" <<< "$manifest")"
+
+            if [ -n "${cnf["library.alias"]}" ]; then
+                manifest="$(jq ".alias = \"${cnf["library.alias"]}\"" <<< "$manifest")"
+            fi
+
+            tee "$file" <<< "$manifest" >/dev/null 2>&1
+        ;;
+    esac
+}
+
+
+###
+#
+#
+do_info_library() {
+    if ! load_library "${cnf["module.arg"]}"; then
+        echo "The library '${cnf["module.arg"]}' does not exist" >&2; return 1
+    fi
+
+    echo "Library: ${cnf["library"]}"
+
+    if [[ "${cnf["library"]}" != "${cnf["library.alias"]}" ]]; then
+        echo "Alias: ${cnf["library.alias"]}"
+    fi
+
+    if [ -n "${cnf["library.date"]}" ]; then
+        echo "Refreshed: $(date -d "${cnf["library.date"]}" +'%F %T')"
+
+    else
+        echo "Refreshed: Never"
+    fi
+
+    echo "Tags: $(cat "${cnf["library.tags"]}" 2>/dev/null | wc -l)"
+    echo "Images: $(cat "${cnf["library.images"]}" 2>/dev/null | wc -l)"
+}
+
+
+###
+#
+#
+do_list_libraries() {
+    local file
+
+    for file in "${cnf["cache.dir"]}"/*.manifest; do
+        if ! jq empty "$file" >/dev/null 2>&1; then
+            continue
+
+        else
+            jq -r '.library' "$file"
+        fi
+    done
+}
+
+
+###
+#
+#
+load_library() {
+    local names="$1" name
+
+    if ! grep -q '/' <<< "$names"; then
+        names="$names ${cnf["reg.default.namespace"]}/$names"
+    fi
+
+    for file in "${cnf["cache.dir"]}"/*.manifest; do
+        for name in $names; do
+            if ! jq empty "$file" >/dev/null 2>&1; then
+                continue
+
+            elif [[ "$(jq -r '.alias' "$file")" == "$name" || "$(jq -r '.library' "$file")" == "$name" ]]; then
+                cnf["library"]="$(jq -r '.library' "$file")"
+                cnf["library.alias"]="$(jq -r '.alias' "$file")"
+                cnf["library.date"]="$(jq -r '.date' "$file")"
+                cnf["library.images"]="$(jq -r '.files.images' "$file")"
+                cnf["library.tags"]="$(jq -r '.files.tags' "$file")"
+                cnf["library.manifest"]="$file"
+
+                return 0
+            fi
+        done
+    done
+
+    return 1
+}
+
+
+###
+#
+#
+while true; do
+    if [ -n "$1" ]; then
+        case "${1::1}" in
+            "-")
+                if [[ "${1::2}" == "--" ]]; then
+                    case "${1:2}" in
+                        version)
+                            echo "${cnf["script.version"]}"; exit 0
+                        ;;
+
+                        help)
+                            print_help; exit 0
+                        ;;
+
+                        os)
+                            shift
+                            cnf["image.os"]="$1"
+                        ;;
+
+                        arch)
+                            shift
+                            cnf["image.arch"]="$1"
+                        ;;
+                        
+                        ere)
+                            shift
+                            cnf["tags.regexp"]="$1"
+                        ;;
+
+                        alias)
+                            shift
+                            cnf["library.alias"]="$1"
+                        ;;
+
+                        *)
+                            echo "Unknown option '$1'" >&2; exit 1
+                        ;;
+                    esac
+
+                else
+                    for (( i=1; i < ${#1}; i++ )); do
+                        case "${1:$i:1}" in
+                            h)
+                                print_help; exit 0
+                            ;;
+
+                            v)
+                                cnf["debug.verbose"]="true"
+
+                                if [[ "${1:$(($i + 1)):1}" == "v" ]]; then
+                                    cnf["debug.verbose.extra"]="true"
+                                    i=$($i + 1)
+                                fi
+                            ;;
+
+                            *)
+                                echo "Unknown option '${1:$i:1}'" >&2; exit 1
+                            ;;
+                        esac
+                    done
+                fi
+            ;;
+
+            *)
+                if [ -z "${cnf["module"]}" ]; then
+                    cnf["module"]="$1"
+
+                elif [ -z "${cnf["module.cmd"]}" ]; then
+                    cnf["module.cmd"]="$1"
+
+                elif [[ -z "${cnf["module.arg"]}" ]]; then
+                    cnf["module.arg"]="$1"
+
+                else
+                    if [ -z "${cnf["module.extra"]}" ]; then
+                        cnf["module.extra"]="$1"
+
+                    else
+                        cnf["module.extra"]="${cnf["module.extra"]} $1"
+                    fi
+
+                    i=0
+                    while :; do
+                        if [[ -z "${cnf["module.extra,$i"]}" ]]; then
+                            cnf["module.extra,$i"]="$1"; break
+                        fi
+
+                        i=$(($i + 1))
+                    done
+                fi
+            ;;
+        esac
+
+    else
+        break
+    fi
+
+    shift
+done
+
+
+###
+#
+#
+if [[ -z "${cnf["module"]}" || -z ${cnf["module.cmd"]} ]]; then
+    echo "Invalid argument length" >&2; exit 1
+fi
+
+if [ -d ~/ ]; then
+    mkdir ~/.cache 2>/dev/null
+
+    if [ -d ~/.cache ]; then
+        cnf["tmp.dir"]=~/.cache
+    fi
+
+elif [[ ! -w "${cnf["tmp.dir"]}" || ! -r "${cnf["tmp.dir"]}" ]]; then
+    echo "The path '${cnf["tmp.dir"]}' is not accessable to this user" >&2; exit 1
+fi
+
+if [ ! -d "${cnf["cache.dir"]}" ]; then
+    if ! mkdir "${cnf["cache.dir"]}" 2>/dev/null; then
+        echo "Could not create missing directory '${cnf["cache.dir"]}'" >&2; exit 1
+    fi
+
+elif [[ ! -w "${cnf["cache.dir"]}" || ! -r "${cnf["cache.dir"]}" ]]; then
+    echo "The path '${cnf["cache.dir"]}' is not accessable to this user" >&2; exit 1
+fi
+
+for file in "${cnf["cache.dir"]}"/*; do
+    if [ -e "$file" ]; then
+        if [[ ! -w "$file" || ! -r "$file" ]]; then
+            echo "The file '$file' is not accessable to this user" >&2; exit 1
+        fi
+    fi
+done
+
+if ! which jq >/dev/null 2>&1; then
+    echo "Missing the JSON processor 'jq' command" >&2; exit 1
+
+elif ! which bc >/dev/null 2>&1 && ! ( which busybox >/dev/null 2>&1 && busybox --list | grep 'bc' ); then
+    # This should not be needed, but basic does not automatically mean included by default
+    echo "Missing the Basic Calculator 'bc' command" >&2; exit 1
+
+elif ! which bc >/dev/null 2>&1; then
+    bc() {
+        if [ -p /dev/stdin ]; then
+            busybox bc "$@" /dev/stdin
+
+        else
+            busybox bc "$@"
+        fi
+    }
+fi
+
+
+###
+#
+#
+case "${cnf["module"]}" in
+    "inspect")
+        if [[ -z "${cnf["module.arg"]}" ]]; then
+            echo "Invalid argument length" >&2; exit 1
+            
+        elif [[ -z "${cnf["module.extra"]}" ]]; then
+            echo "Missing a reference" >&2; exit 1
+            
+        elif ! load_library "${cnf["module.arg"]}"; then
+            if ! grep -q '/' <<< "${cnf["module.arg"]}"; then
+                cnf["module.arg"]="${cnf["reg.default.namespace"]}/${cnf["module.arg"]}"
+            fi
+
+        else
+            cnf["module.arg"]="${cnf["library"]}"
+        fi
+        
+        case "${cnf["module.cmd"]}" in
+            "manifest")
+                url="$(printf "${cnf["url.manifest"]}" "${cnf["reg.addr"]}" "${cnf["module.arg"]}" "${cnf["module.extra"]}")"
+                manifest="$(http_request "$url" -H "Authorization: Bearer $(auth_get_key)" -H "Accept: application/vnd.docker.distribution.manifest.v2+json" -H "Accept: application/vnd.docker.distribution.manifest.list.v2+json" -H "Accept: application/vnd.oci.image.index.v1+json" -H "Accept: application/vnd.oci.image.manifest.v1+json")"; ret=$?
+
+                if [ $ret -ne 200 ]; then
+                    print_err "Trying to get manifest returned code $ret" "$manifest"
+
+                    exit 1
+                fi
+                
+                jq <<< "$manifest"
+            ;;
+            
+            "blob")
+                url="$(printf "${cnf["url.blobs"]}" "${cnf["reg.addr"]}" "${cnf["module.arg"]}" "${cnf["module.extra"]}")"
+                image="$(http_request "$url" -H "Authorization: Bearer $(auth_get_key)" -H "Accept: application/vnd.docker.container.image.v1+json" -H "Accept: application/vnd.oci.image.config.v1+json")"; ret=$?
+
+                if [ $ret -ne 200 ]; then
+                    print_err "Trying to get image blob returned code $ret" "$image"
+
+                    exit 1
+                fi
+                
+                jq <<< "$image"
+            ;;
+
+            *)
+                echo "Unknown argument '$1'" >&2; exit 1
+            ;;
+        esac
+    ;;
+
+    "library")
+        case "${cnf["module.cmd"]}" in
+            "list")
+                do_list_libraries; exit $?
+            ;;
+        esac
+
+        if [[ -z "${cnf["module.arg"]}" ]]; then
+            echo "Invalid argument length" >&2; exit 1
+        fi
+
+        case "${cnf["module.cmd"]}" in
+            "init")
+                do_init_library; exit $?
+            ;;
+
+            "info")
+                do_info_library; exit $?
+            ;;
+
+            *)
+                echo "Unknown argument '$1'" >&2; exit 1
+            ;;
+        esac
+    ;;
+
+    "registry")
+        if [[ -z "${cnf["module.arg"]}" ]]; then
+            echo "Invalid argument length" >&2; exit 1
+
+        elif ! load_library "${cnf["module.arg"]}"; then
+            echo "Please initialize '${cnf["module.arg"]}' using the 'library init' command" >&2; exit 1
+
+        else
+            cnf["module.arg"]="${cnf["library"]}"
+        fi
+
+        case "${cnf["module.cmd"]}" in
+            "refresh")
+                do_registry_refresh; exit $?
+            ;;
+
+            "info")
+                if [ -z "${cnf["module.extra"]}" ]; then
+                    echo "Missing a reference" >&2; exit 1
+                fi
+
+                do_show_info; exit $?
+            ;;
+
+            "list")
+                if [ -z "${cnf["module.extra"]}" ]; then
+                    echo "Missing a reference" >&2; exit 1
+                fi
+
+                do_show_list; exit $?
+            ;;
+
+            *)
+                echo "Unknown argument '$1'" >&2; exit 1
+            ;;
+        esac
+    ;;
+    
+    *)
+        echo "Unknown argument '${cnf["module"]}'" >&2; exit 1
+    ;;
+esac
+
